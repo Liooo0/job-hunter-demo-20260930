@@ -1,0 +1,898 @@
+#!/usr/bin/env python3
+"""51job 自动投递 v4 — 升级: 9223 + evaluate_job(L2决策) + record_application落库 + 日限50
+
+复用 v3 的抓取/点击核心(sensorsdata结构化卡片), 决策层从 score_jd 换成 job_decision.evaluate_job
+规则全平台统一: 底薪≥8K / 薪资≤60K / 排除销售标注狼性实习
+独立限额: 50/天 (不占Boss的150)
+"""
+import argparse, json, time, random, sys, os
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
+from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).parent))
+from DrissionPage import ChromiumPage
+from job_decision import evaluate_job, cohort_block_reason, round_direction
+from store import record_application, company_applied_recently
+from notify import alert
+
+# ════════════════════════════════════════════════════════════════════
+# 运行数据库路径（本机文件，不进仓库）
+# ════════════════════════════════════════════════════════════════════
+# 2026-09-25 提取为模块级常量：原来两处各写一遍 `Path(__file__).parent /
+# 'ab_experiment.db'`，测试无法把它指到临时库上，于是测试只能读**生产库**
+# （本机文件、不在仓库）→ 干净检出必定 `no such table: applications_v2`。
+# 用常量之后测试可以 patch 它（见 tests/test_v53_51job_resilience.py）。
+DB_PATH = Path(__file__).parent / 'ab_experiment.db'
+
+
+def in_night_window() -> bool:
+    """夜间禁投 22:00-8:00（与 boss_apply 同规则，封号红线）"""
+    h = datetime.now().hour
+    return h >= 22 or h < 8
+
+
+# ── 站外页面红线（2026-09-29 用户明令：「做掉，不能再开这个网页。强调很多次了。」）──
+# 事故链路：51job 搜索结果里「校招/应届」类岗位的「申请」按钮，点了会**另开一个标签页**
+# 跳到应届生求职网（q.yingjiesheng.com/jobdetail/NNN.html?partner=51wspcjoblist）。
+# 脚本点完只在原卡片上找回执（拿不到「已申请」）→ 判 FAILED、明天还会再点一次；
+# 而那个新开的站外标签页**没人关**。实测 9/27 一天 208 次访问、同一岗位页重复 99 次、
+# 投递 Chrome 里残留这类标签页 37 个（9/27 事故记录里写成「来源未明」，即是此处）。
+#
+# 现在三道闸，缺一不可：
+#   ① 点之前：卡片自身/申请按钮带站外链接、或 jobId 已在黑名单 → 直接跳过，不点
+#   ② 点之后：立刻查一遍标签页，凡不在 51job 白名单的**当场关掉**
+#   ③ 关的同时把 jobId 记进 data/foreign_skip.json —— 这个岗位以后**永不点击**
+# 只认白名单（we/www/login/m.51job.com）；其余一律按站外处理（fail-closed）。
+SITE_ALLOWED = ("we.51job.com", "www.51job.com", "login.51job.com", "m.51job.com", "51job.com")
+SITE_FORBIDDEN = ("yingjiesheng.com",)                                    # 应届生求职网：明令禁开
+SITE_CAMPUS = ("xyz.51job.com", "young.51job.com", "campus.51job.com")    # 51job 校招通道
+SITE_IGNORE = ("goofish", "taobao", "zhipin", "chrome://", "chrome-extension://",
+               "edge://", "devtools://", "about:")
+FOREIGN_SKIP_FILE = Path(__file__).parent / "data" / "foreign_skip.json"
+FOREIGN_ABORT_PER_ROUND = 3      # 单轮触发上限，超过即中止本轮（防反复开站外页）
+FOREIGN_HITS = {"round": 0}      # 本轮触发计数（main 每轮清零）
+
+
+def site_host(url: Optional[str]) -> str:
+    """取 URL 的 host（小写、去端口）；about:blank / 空串返回 ''。"""
+    u = (url or "").strip()
+    if not u or u in ("about:blank", "chrome://newtab/"):
+        return ""
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(u).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def forbidden_hit(url: Optional[str]) -> Optional[str]:
+    """站外判定：命中返回人话标签（日志/落库用），安全返回 None。
+
+    about:blank（投递 tab 起家页）与 51job 自有域名算安全。命中顺序：
+    应届生网 > 校招通道 > 白名单外的任何域名（fail-closed）。
+    """
+    h = site_host(url)
+    if not h:
+        return None
+    for bad in SITE_FORBIDDEN:
+        if h == bad or h.endswith("." + bad):
+            return f"站外:{bad}"
+    for bad in SITE_CAMPUS:
+        if h == bad or h.endswith("." + bad):
+            return f"校招通道:{bad}"
+    for ok in SITE_ALLOWED:
+        if h == ok or h.endswith("." + ok):
+            return None
+    return f"站外:{h}"
+
+
+def _load_foreign_skips() -> set:
+    """读「永不点击」黑名单（站外跳转过的 jobId）。"""
+    try:
+        d = json.loads(FOREIGN_SKIP_FILE.read_text())
+        return set(str(x) for x in (d.get("jobIds") or []))
+    except Exception:
+        return set()
+
+
+def _remember_foreign_skip(job_id: str, title: str = "", company: str = "",
+                           url: str = "", why: str = "") -> None:
+    """把站外跳转过的岗位记进黑名单 —— 以后永不点击（用户 2026-09-29 明令）。"""
+    if not job_id:
+        return
+    try:
+        data = {"jobIds": [], "detail": []}
+        if FOREIGN_SKIP_FILE.exists():
+            try:
+                data = json.loads(FOREIGN_SKIP_FILE.read_text()) or data
+            except Exception:
+                pass
+        data.setdefault("jobIds", [])
+        data.setdefault("detail", [])
+        if str(job_id) not in [str(x) for x in data["jobIds"]]:
+            data["jobIds"].append(str(job_id))
+        data["detail"].append({"jobId": str(job_id), "title": (title or "")[:60],
+                               "company": (company or "")[:40], "url": (url or "")[:160],
+                               "why": why, "at": datetime.now().isoformat(timespec="seconds")})
+        data["detail"] = data["detail"][-200:]
+        FOREIGN_SKIP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        FOREIGN_SKIP_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+        print(f"    🚫 已拉黑 jobId={job_id}（{why}）以后不再点击")
+    except Exception as e:
+        print(f"    ⚠️ 站外黑名单写入失败: {e}")
+
+
+def _cdp_targets():
+    """列出 9223 Chrome 的全部标签页（原生 CDP：DrissionPage 的 get_tab 本机会超时）。"""
+    import urllib.request as _url
+    try:
+        with _url.urlopen(f"http://127.0.0.1:{PORT}/json/list", timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return []
+
+
+def _cdp_close(tid: str) -> bool:
+    import urllib.request as _url
+    try:
+        with _url.urlopen(f"http://127.0.0.1:{PORT}/json/close/{tid}", timeout=5) as resp:
+            resp.read()
+        return True
+    except Exception:
+        return False
+
+
+def _delivery_chrome_ok(port: Optional[int] = None) -> bool:
+    """确认该端口上的 Chrome 就是**投递专用实例**（命令行含 job-hunter-chrome）。
+
+    为什么必须这层：下面这个函数会关标签页。一旦端口配错、打到用户自己的 Chrome 上，
+    就会去关用户正在看的页面。2026-09-29 实测踩过这个坑：验证时起的一次性实例没起来，
+    调用打到了另一个实例上（那里开着用户的 Gemini/Google 页）—— 虽然那次的关闭没生效，
+    但这种「打错实例」不允许再发生，所以宁可全都不关。
+    """
+    port = port or PORT
+    try:
+        import subprocess as _sp
+        pid = _sp.run(["bash", "-lc", f"lsof -ti tcp:{port} | head -1"],
+                      capture_output=True, text=True).stdout.strip()
+        if not pid:
+            return False
+        cmd = _sp.run(["ps", "-o", "command=", "-p", pid],
+                      capture_output=True, text=True).stdout or ""
+        return "job-hunter-chrome" in cmd
+    except Exception:
+        return False
+
+
+def close_foreign_tabs(targets=None, closer=None) -> int:
+    """关掉站外跳转页（应届生网/校招通道）。返回关闭数量。
+
+    **只关明确点名的两类域名**（SITE_FORBIDDEN + SITE_CAMPUS）：
+    白名单外的普通页面一律不动 —— 宁可漏关，也不许误关用户/别的东西。
+    另有两道自保：① 端口上的 Chrome 必须是投递专用实例（job-hunter-chrome）；
+    ② 用户页（闲鱼/Boss）与浏览器内部页绝不碰。targets/closer 可注入便于单测。
+    """
+    if targets is None:
+        if not _delivery_chrome_ok():
+            print(f"  ⚠️ 站外清场跳过：{PORT} 上的 Chrome 不是投递专用实例（job-hunter-chrome）")
+            return 0
+        targets = _cdp_targets()
+    closer = _cdp_close if closer is None else closer
+    closed = 0
+    for t in targets or []:
+        tid = (t or {}).get("id")
+        u = (t or {}).get("url") or ""
+        if not tid:
+            continue
+        if any(k in u for k in SITE_IGNORE):
+            continue
+        h = site_host(u)
+        if not h:
+            continue
+        _named = any(h == b or h.endswith("." + b)
+                     for b in tuple(SITE_FORBIDDEN) + tuple(SITE_CAMPUS))
+        if not _named:
+            continue                      # 白名单外的普通页面：不动
+        why = forbidden_hit(u) or "站外"
+        try:
+            if closer(tid):
+                closed += 1
+                print(f"  🚫 [{why}] 关闭站外页: {u[:80]}")
+        except Exception:
+            pass
+    return closed
+
+
+# ── tab 健康检查与自动重建（2026-09-12 修复）──
+# 事故：本轮投到第 100 条时 tab 掉线（"The connection to the page has been
+# disconnected"），此后每个关键词都在 tab.get() 处抛异常，剩下 6 个关键词全部
+# 空转作废。Boss 侧有 _pick_boss_tab 兜底，51job 之前完全没有。
+TAB_READY_WAIT = 2        # new_tab 后等待就绪秒数（测试可置 0）
+TAB_RETRY_WAIT = 3        # 重建重试间隔秒数（测试可置 0）
+HOURLY_REST_SEC = 30 * 60  # 单小时熔断休息时长，与 boss_apply 一致（测试可置 0）
+
+
+def _tab_alive(tab) -> bool:
+    """tab 是否还活着（能执行 JS 即视为活着）。"""
+    if tab is None:
+        return False
+    try:
+        tab.run_js("return 1;")
+        return True
+    except Exception:
+        return False
+
+
+def sweep_stale_tabs(keep=None) -> int:
+    """清扫投递 Chrome 里堆积的僵尸标签页（每轮开始前调用）。
+
+    用**原生 CDP HTTP 接口**而不是 DrissionPage 的 tab API —— 实测后者在本机
+    Chrome 上 `get_tab()` 会超时（一超时整轮清扫就静默失败，关 0 个页）。
+    CDP HTTP 只有两个端点：/json/list 列页、/json/close/<id> 关页。
+
+    安全边界（**红线**，不可放宽）：
+      · 只关 51job 自己的搜索页 / about:blank
+      · **绝不碰** 用户闲鱼（goofish / taobao）、Boss 聊天页、chrome:// 内部页
+      · 只有当没有别的投递进程在跑时才清扫（避免关掉并发轮次的 tab）
+    """
+    import json as _json
+    import subprocess as _sp
+    import urllib.request as _url
+
+    # [] 括号技巧：否则 pgrep 会匹配到执行这段代码的 bash 命令行本身（自匹配）
+    running = _sp.run(["bash", "-lc",
+                       'pgrep -f "boss_apply[.]py|platform_liepin[.]py" | head -1'],
+                       capture_output=True, text=True).stdout.strip()
+    if running:
+        return 0
+    try:
+        with _url.urlopen(f"http://127.0.0.1:{PORT}/json/list", timeout=5) as resp:
+            targets = _json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return 0
+    closed = 0
+    for t in targets:
+        tid = t.get("id")
+        u = t.get("url") or ""
+        if not tid or (keep and tid == keep):
+            continue
+        if any(k in u for k in SITE_IGNORE):
+            continue
+        # 站外红线（2026-09-29）：只扫**明确点名**的两类域名（应届生网/校招通道），
+        # 白名单外的普通页面不动 —— 关标签页宁缺勿滥（清场另有实例身份校验）。
+        _h = site_host(u)
+        _named = bool(_h) and any(_h == b or _h.endswith("." + b)
+                                  for b in tuple(SITE_FORBIDDEN) + tuple(SITE_CAMPUS))
+        disposable = (_named
+                      or ("51job.com" in u and "/pc/search" in u)
+                      or u in ("about:blank", ""))
+        if not disposable:
+            continue
+        try:
+            with _url.urlopen(f"http://127.0.0.1:{PORT}/json/close/{tid}", timeout=5) as resp:
+                resp.read()
+            closed += 1
+        except Exception:
+            pass
+    if closed:
+        print(f"  🧹 清掉僵尸标签页 {closed} 个（闲鱼/Boss 页已跳过）")
+    return closed
+
+
+def ensure_tab(page, tab):
+    """tab 失联则重建（关旧 + 开新），最多重试 3 次。
+
+    返回可用 tab；重建失败返回 None（调用方应中止本轮，不要继续空转）。
+    """
+    if _tab_alive(tab):
+        return tab
+    print("  🔧 投递 tab 失联，重建中…")
+    if tab is not None:
+        try:
+            tab.close()
+        except Exception:
+            pass
+    for i in range(1, 4):
+        try:
+            new_tab = page.new_tab("about:blank", background=True)  # 后台建标签：不把窗口顶到用户屏幕
+            time.sleep(TAB_READY_WAIT)
+            if _tab_alive(new_tab):
+                print("  ✅ tab 已重建")
+                return new_tab
+            # ★ 2026-09-18 补：新建出来但不可用的 tab 必须立刻关掉。
+            #   实测每轮重建都会泄漏一个僵尸标签页（攒到 11 个），
+            #   僵尸页反过来加重 Chrome 负担 → 更容易再次失联（恶性循环）。
+            try:
+                new_tab.close()
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"  ⚠️ tab 重建失败({i}/3): {e}")
+        time.sleep(TAB_RETRY_WAIT)
+    print("  🛑 tab 连续 3 次重建失败，本轮收工")
+    return None
+
+
+# ── 单小时熔断（2026-09-12 补：51job 原先只认日限额，小时闸完全没接）──
+# 与 boss_apply 同约定：本小时已投 ≥ cap → 休息 30 分钟再继续（分段 sleep 可中断）。
+# 依据：2026-08-11 封号事故（单小时 47 份是主因之一）。
+def hourly_applied(hour_prefix: Optional[str] = None) -> int:
+    """本小时已投条数（跨进程，查 DB）。
+
+    ⚠️ created_at 是 ISO 格式（'2026-09-12T08:14:33'，T 分隔），不是空格分隔。
+    2026-09-12 踩坑：首版用 "%Y-%m-%d %H" 生成前缀，与 DB 永远匹配不上 → 恒返回 0
+    → 小时闸形同虚设。必须用 "%Y-%m-%dT%H"。
+    """
+    import sqlite3
+    hour_prefix = hour_prefix or datetime.now().strftime("%Y-%m-%dT%H")
+    try:
+        con = sqlite3.connect(str(DB_PATH))
+        n = con.execute(
+            "SELECT COUNT(*) FROM applications_v2 WHERE platform='51job' "
+            "AND substr(created_at,1,13)=? AND status IN ('UNCERTAIN','APPLIED','VERIFIED')",
+            (hour_prefix,)).fetchone()[0]
+        con.close()
+        return n or 0
+    except Exception:
+        return 0
+
+
+def hourly_gate(cap: int) -> None:
+    """本小时达上限 → 休息 30 分钟（与 boss_apply 同款分段 sleep）。"""
+    if not cap:
+        return
+    n = hourly_applied()
+    if n < cap:
+        return
+    rest = HOURLY_REST_SEC
+    print(f"\n  🕐 [hour_limit_reached] 本小时已投 {n} 条 ≥ {cap}，"
+          f"暂停 {rest // 60} 分钟防风控（kill switch 未动）")
+    for _ in range(max(0, rest) // 5):
+        time.sleep(5)
+    print(f"  ▶️ 休息结束，继续（本小时 {hourly_applied()}/{cap}）")
+
+CITY_CODES = {
+    "深圳": "040000", "广州": "030200", "北京": "010000", "上海": "020000",
+    "东莞": "030800", "佛山": "030600", "惠州": "031600", "珠海": "030400",
+    "杭州": "080200", "成都": "090200", "武汉": "170200", "南京": "060200",
+    "苏州": "060800", "西安": "110200", "天津": "030500", "重庆": "040200",
+}
+DAILY_LIMIT = 100  # 2026-09-12: 用户定稿「以 9/12 实际投出量 100 作为该平台日限额」（原 120）
+HOURLY_CAP = 10    # 单小时上限（启动时从 config.json 的 safety 块覆盖；2026-09-12 接入）
+PORT = 9223
+
+
+def load_safety() -> dict:
+    """读取 config.json 的 safety 块（与 boss_apply.get_safety 同源，缺省保守）。
+
+    注：原来 main() 里那句 `import config` 是死代码——仓库只有 config/ 目录，
+    被 Python 当命名空间包导入，拿不到任何配置。
+    """
+    defaults = {"hourly_cap": 10, "night_ban_start": 22, "night_ban_end": 8}
+    try:
+        from shared import load_config
+        cfg = load_config()
+        defaults.update(cfg.get("safety") or {})
+    except Exception as e:
+        print(f"⚠️ 读取 safety 配置失败({e})，用保守默认值 {defaults}")
+    return defaults
+
+
+
+def get_cards(tab):
+    return tab.run_js("""
+        return Array.from(document.querySelectorAll('.joblist-item')).map(c => {
+            var sd = {};
+            try { sd = JSON.parse(c.querySelector('[sensorsdata]')?.getAttribute('sensorsdata') || '{}'); } catch(e) {}
+            var btn = c.querySelector('button.btn.apply');
+            var companyEl = c.querySelector('a[href*="co"]') || c.querySelector('a');
+            // 站外红线（2026-09-29）：把卡片里的链接与申请按钮的跳转目标读出来，
+            // 点之前就能判出「这卡会跳到应届生网/校招通道」→ 直接跳过，不点。
+            var links = Array.from(c.querySelectorAll('a[href]')).map(a => a.href || a.getAttribute('href') || '');
+            var anchor = btn ? btn.closest('a') : null;
+            var applyHref = anchor ? (anchor.href || '')
+                                   : (btn ? (btn.getAttribute('data-url') || btn.getAttribute('href') || '') : '');
+            return {
+                jobId: sd.jobId || '',
+                title: sd.jobTitle || '',
+                salary: sd.jobSalary || '',
+                area: sd.jobArea || '',
+                year: sd.jobYear || '',
+                degree: sd.jobDegree || '',
+                company: (companyEl?.innerText || '').trim() || sd.brandName || '',
+                btnText: (btn?.innerText || '').trim(),
+                link: links.join(' '),
+                applyHref: applyHref,
+            };
+        }).filter(x => x.jobId);
+    """) or []
+
+
+def click_apply_and_check(tab, job_id):
+    for _ in range(2):
+        tab.run_js(f"""
+            var cards = document.querySelectorAll('.joblist-item');
+            for (var c of cards) {{
+                var sd = c.querySelector('[sensorsdata]');
+                if (!sd) continue;
+                try {{
+                    var d = JSON.parse(sd.getAttribute('sensorsdata'));
+                    if (String(d.jobId) === "{job_id}") {{
+                        var btn = c.querySelector('button.btn.apply');
+                        if (!btn) return;
+                        c.scrollIntoView({{block:'center'}});
+                        btn.click();
+                    }}
+                }} catch(e) {{}}
+            }}
+        """)
+        time.sleep(2.5)
+        state = tab.run_js(f"""
+            var cards = document.querySelectorAll('.joblist-item');
+            for (var c of cards) {{
+                var sd = c.querySelector('[sensorsdata]');
+                if (!sd) continue;
+                try {{
+                    var d = JSON.parse(sd.getAttribute('sensorsdata'));
+                    if (String(d.jobId) === "{job_id}") {{
+                        return (c.querySelector('button.btn.apply')?.innerText || '').trim();
+                    }}
+                }} catch(e) {{}}
+            }}
+            return '';
+        """)
+        if "已申请" in state or "已投递" in state:
+            return state
+    return ""
+
+
+def run_city_keyword(page, tab, city, keyword, count, seen, today_applied, direction=None):
+    """返回 (applied, skipped, tab)。
+
+    ⚠️ tab 可能在中途被重建，调用方必须接住返回的新引用（2026-09-12 修复）。
+    """
+    city_code = CITY_CODES.get(city)
+    if not city_code:
+        return 0, 0, tab
+    url = f"https://we.51job.com/pc/search?keyword={quote(keyword)}&jobArea={city_code}&degree=04&workyear=02,03"
+    applied, skipped = 0, 0
+    page_num = 1
+    empty_streak = 0
+
+    print(f"\n{'='*50}\n📍 {city} | 🔍 {keyword} | 🎯 {count}\n{'='*50}")
+
+    def goto(tab_, pnum):
+        """导航到第 pnum 页；tab 失联则重建重试。返回 (tab, ok)。"""
+        target = url if pnum == 1 else f"{url}&pageNum={pnum}"
+        for attempt in range(1, 4):
+            tab_ = ensure_tab(page, tab_)
+            if tab_ is None:
+                return None, False
+            try:
+                tab_.get(target)
+            except Exception as e:
+                print(f"  ⚠️ 导航失败({attempt}/3): {e}")
+                time.sleep(3)
+                continue
+            # 站外红线：投递页被跳到站外（校招/应届生网）→ 当场关掉、重建，不在此页停留
+            _bad = forbidden_hit(tab_.url)
+            if _bad:
+                print(f"  🚫 投递页被跳到 [{_bad}]，关闭并重建: {(tab_.url or '')[:70]}")
+                FOREIGN_HITS["round"] += 1
+                try:
+                    tab_.close()
+                except Exception:
+                    pass
+                tab_ = None
+                time.sleep(1.5)
+                continue
+            time.sleep(4 + random.uniform(0, 2))
+            if _tab_alive(tab_):
+                return tab_, True
+            print(f"  ⚠️ 导航后 tab 失联，重建重试({attempt}/3)")
+        return tab_, False
+
+    tab, ok = goto(tab, 1)
+    if not ok or tab is None:
+        print("  🛑 首屏导航失败，跳过本关键词")
+        return applied, skipped, tab
+
+    if "login" in (tab.url or "").lower():
+        print("⚠️ 未登录 51job")
+        alert("51job:login", "51job 未登录，本轮投递作废",
+              "浏览器里的 51job 登录态掉了，需要手动登录后重跑。\n"
+              "在本轮修复前，这种情况是静默的。", level="error", throttle=0)
+        return applied, skipped, tab
+
+    while applied < count and empty_streak < 3 and page_num <= 6:
+        tab, ok = goto(tab, page_num)
+        if not ok or tab is None:
+            print("  🛑 导航失败，结束本关键词")
+            break
+        tab.run_js("window.scrollTo(0, document.body.scrollHeight);"); time.sleep(1.5)
+        tab.run_js("window.scrollTo(0, 0);"); time.sleep(1)
+
+        try:
+            cards = get_cards(tab)
+        except Exception as e:
+            print(f"  ⚠️ 抓卡片失败: {e}")
+            tab = ensure_tab(page, tab)
+            if tab is None:
+                break
+            continue
+        if not cards:
+            empty_streak += 1; page_num += 1; continue
+
+        pending = [c for c in cards if c["jobId"] not in seen and "已申请" not in c["btnText"] and "已投递" not in c["btnText"]]
+        # ── 站外红线①：点之前就把会跳站外的卡片剔掉（2026-09-29）──
+        # 两个判据：jobId 已在「永不点击」黑名单；或卡片/申请按钮的链接指向站外。
+        _skips = _load_foreign_skips()
+        _keep = []
+        for c in pending:
+            _hit = "站外:黑名单(永久)" if str(c["jobId"]) in _skips else None
+            if not _hit:
+                _hit = forbidden_hit(c.get("applyHref")) or forbidden_hit(c.get("link"))
+            if _hit:
+                seen.add(c["jobId"])
+                skipped += 1
+                print(f"  [🚫{_hit}] {c['title'][:32]} → 不点（站外岗位）")
+                continue
+            _keep.append(c)
+        pending = _keep
+        if not pending:
+            page_num += 1; empty_streak += 1; continue
+        empty_streak = 0
+        print(f"  第{page_num}页 | {len(cards)}卡 | 待处理 {len(pending)}")
+
+        tab_lost = False
+        for c in pending:
+            if applied >= count or today_applied >= DAILY_LIMIT:
+                break
+            if in_night_window():
+                print("  🌙 夜间禁投，停止本页处理")
+                return applied, skipped, tab
+            seen.add(c["jobId"])
+
+            # ── 同公司去重（跨批次，防短时间内重复投同公司触发风控）──
+            comp = c.get("company") or ""
+            t = c["title"] or ""
+            _safety = load_safety()
+            _ddays = int(_safety.get("dedup_days", 7) or 0)
+            if _ddays > 0 and comp and company_applied_recently(city, comp, _ddays, platform="51job"):
+                skipped += 1
+                dedup_reason = f"同公司{_ddays}天内已投(去重)"
+                print(f"  [🔁去重] {comp[:15]} | {t[:25]} — {_ddays}天内已投过该公司，跳过")
+                try:
+                    record_application(
+                        platform="51job", city=city, company=comp,
+                        title=t, salary=c.get("salary") or "", keyword=keyword,
+                        score=0, resume_version="E", decision="skipped",
+                        status="SKIPPED", reason=f"dedup_skip:{dedup_reason}"[:80],
+                        verified=0, event_type="dedup_skip", event_error=None,
+                        extra_payload={"jobId": c.get("jobId"), "area": c.get("area", ""),
+                                       "dedup_days": _ddays},
+                        gates=None, greeting_template_id=None,
+                    )
+                except Exception as e:
+                    print(f"    ⚠️ 去重落库失败: {e}")
+                continue
+
+            # 届别闸：拦校招/实习/届别过晚，放行合理应届（2026-09-20 收敛）
+            # 规则实现在 job_decision.cohort_block_reason，本平台不再自带一份正则
+            # —— 原来那份 `[0-9]{2}届` 会把用户自己的 25届 一起拦掉。
+            _cohort = cohort_block_reason(t)
+            if _cohort:
+                skipped += 1
+                print(f"  [🚫届别] {t[:35]} | {c['salary']} → {_cohort}")
+                continue
+
+            # L2 决策(全平台统一规则) — 与 boss_apply 同款三段闸
+            reason = ""
+            block = False
+            try:
+                # 方向闸（2026-09-23）：按**整轮**判方向，不按单个关键词。
+                # 起因：A 池关键词里除了「游戏运营」还有「活动运营」这种泛词（不含"游戏"），
+                # 逐词判会让那一批照旧漏过去 —— 而 A 池整轮的目标就是游戏行业岗。
+                # 规则实现在 job_decision.title_direction_block，本平台只负责把方向传下去。
+                dec = evaluate_job(c["company"] or "", c["title"], "", c["salary"],
+                                   city=city, direction=direction)
+                if getattr(dec, "action", None) == "REJECT":
+                    reason = getattr(dec, "reason", "L2拒绝")
+                    block = True
+                else:
+                    reason = f"L2:({getattr(dec, 'priority', '?')}|{getattr(dec, 'salary_band', '?')})"
+                # 作息制度：51job 搜索卡片没有正文 → 结论是 UNKNOWN，不是「双休已验证」。
+                # 单独记一份，避免把「没查过」当成「查过没问题」。
+                schedule_verdict = getattr(dec, "schedule_verdict", "UNKNOWN")
+            except Exception as e:
+                print(f"  [⚠️决策器异常] {c['title'][:30]}: {e}")
+                continue
+            # L3 语义层(销售/标注伪装)
+            if not block:
+                try:
+                    import semantic_parser as _SP
+                    sp_reason = _SP.gate(c["title"], "", c["company"] or "")
+                    if sp_reason:
+                        reason = f"语义:{sp_reason}"
+                        block = True
+                except Exception as e:
+                    print(f"  [⚠️语义层异常] {e}")
+            # Plan Router(岗位错位闸)
+            if not block:
+                try:
+                    from plan_router import route_plan
+                    from job_decision import parse_salary_low
+                    _pr = route_plan(c["company"] or "", c["title"], "",
+                                     parse_salary_low(c["salary"]), city=city)
+                    if getattr(_pr, "plan", None) == "NO_PLAN":
+                        reason = f"路由:{getattr(_pr, 'reason', 'NO_PLAN')}"
+                        block = True
+                except Exception as e:
+                    print(f"  [⚠️路由异常] {e}")
+            if block:
+                skipped += 1
+                print(f"  [🚫] {c['title'][:35]} | {c['salary']} → {reason}")
+                continue
+
+            # tab 掉线保护：点击前先确认 tab 活着（2026-09-12 修复）
+            if not _tab_alive(tab):
+                print("  ⚠️ tab 失联（点击前），重建并重新抓卡片")
+                tab = ensure_tab(page, tab)
+                if tab is None:
+                    return applied, skipped, tab
+                tab_lost = True
+                break
+            # 单小时熔断（与 boss_apply 同约定：满了休息 30 分钟再继续）
+            hourly_gate(HOURLY_CAP)
+
+            print(f"  [✅{c['title'][:30]}] | {c['salary']} | {c['company'][:15]}"
+                  f" | 制度:{schedule_verdict}")
+            try:
+                state = click_apply_and_check(tab, c["jobId"])
+            except Exception as e:
+                print(f"    ⚠️ 点击异常: {e}")
+                state = ""
+            # ── 站外红线②③：点完立刻清场 + 永久拉黑（2026-09-29，用户明令）──
+            # 校招/应届类岗位的「申请」会另开标签页跳到应届生求职网；点完马上关，
+            # 并把 jobId 记进黑名单（以后连点都不点）。单轮触发过多直接中止本轮。
+            _closed_foreign = close_foreign_tabs()
+            if _closed_foreign:
+                FOREIGN_HITS["round"] += 1
+                _why = "校招/应届岗位另开站外页(应届生网)"
+                _remember_foreign_skip(c["jobId"], c["title"], c["company"] or "",
+                                       "", _why)
+                skipped += 1
+                print("    🚫 该岗位跳站外页 —— 已关闭页面 + 永久拉黑，不再重试")
+                try:
+                    record_application(
+                        platform="51job", city=city, company=c["company"] or "未知",
+                        title=c["title"], salary=c["salary"], keyword=keyword,
+                        score=0, resume_version="E", decision="skipped",
+                        status="SKIPPED", reason=f"站外跳过:{_why}"[:80],
+                        verified=0, event_type="apply", event_error=None,
+                        extra_payload={"jobId": c["jobId"], "area": c["area"],
+                                       "site_block": _why, "closed_tabs": _closed_foreign},
+                        gates=None, greeting_template_id=None,
+                    )
+                except Exception as e:
+                    print(f"    ⚠️ 落库失败: {e}")
+                if FOREIGN_HITS["round"] >= FOREIGN_ABORT_PER_ROUND:
+                    print("  🛑 本轮站外跳转次数达上限，中止本轮（不再给站外页任何机会）")
+                    alert("51job:foreign_site_stop", "51job 本轮多次跳站外页，已中止本轮",
+                          "站外岗位已拉黑、以后不再点击。若反复出现，检查卡片链接规则。",
+                          level="warn", throttle=3600)
+                    return applied, skipped, tab
+                time.sleep(1.0)
+                continue
+            if "已申请" in state or "已投递" in state:
+                # 2026-09-15 修正：这里原来硬编码 status="UNCERTAIN"、verified=0，
+                # 但它其实是**成功分支** —— 按钮回执已经变成「已申请/已投递」，
+                # 且上一行已经 applied += 1 计数。后果：384 条真实成功的投递在库里
+                # 全是「不确定」，51job 在复盘里永远是「从未验证」；而真正投失败的
+                # 那条路（下面的 else）只 print 不落库 —— 两个方向刚好记反了。
+                # 现在按 store 的约定写 applied/APPLIED + verified=1，并把按钮回执
+                # 原文留作证据；decision 仍写 ALLOW（L2 判决），闸门计数口径不变。
+                applied += 1
+                today_applied += 1
+                try:
+                    record_application(
+                        platform="51job", city=city, company=c["company"] or "未知",
+                        title=c["title"], salary=c["salary"], keyword=keyword,
+                        score=0, resume_version="E", decision="ALLOW",
+                        status="APPLIED", reason=str(reason)[:60],
+                        verified=1, event_type="apply", event_error=None,
+                        extra_payload={"jobId": c["jobId"], "area": c["area"],
+                                       "button_state": state,
+                                       # UNKNOWN = 搜索卡片没有正文，作息根本没查过。
+                                       # 落库是为了让「没查」和「查过没问题」在数据里可分辨。
+                                       "schedule_verdict": schedule_verdict,
+                                       "evidence": "51job按钮回执"},
+                        gates=None, greeting_template_id=None,
+                    )
+                except Exception as e:
+                    print(f"    ⚠️ 落库失败: {e}")
+                print(f"    ✅ 已投递 ({applied}/{count}, 今日{today_applied}/{DAILY_LIMIT})")
+            elif not _tab_alive(tab):
+                # 点击过程中掉线：本次结果不可确定 → 不计入，重建后回外层重来
+                print("    ⚠️ 点击后 tab 失联，本次结果不确定（不计入）")
+                tab = ensure_tab(page, tab)
+                if tab is None:
+                    return applied, skipped, tab
+                tab_lost = True
+                break
+            else:
+                # 2026-09-15 新增：点击后按钮回执没变成「已申请/已投递」（已重试 2 次）
+                # → 记一条 FAILED。以前这条路只 print 不落库，所以「投失败的」在库里
+                # 完全看不见，只能看到一堆 UNCERTAIN。
+                # decision 写 "failed" —— 它不在闸门计数三态（applied/uncertain/ALLOW）
+                # 里，所以不占日/小时额度、也不会被同公司去重拦住，明天可以重投。
+                skipped += 1
+                try:
+                    record_application(
+                        platform="51job", city=city, company=c["company"] or "未知",
+                        title=c["title"], salary=c["salary"], keyword=keyword,
+                        score=0, resume_version="E", decision="failed",
+                        status="FAILED", reason=f"按钮未确认:{state or '无回执'}"[:80],
+                        verified=0, event_type="apply",
+                        event_error=f"按钮状态未确认: {state or '空回执'}",
+                        extra_payload={"jobId": c["jobId"], "area": c["area"]},
+                        gates=None, greeting_template_id=None,
+                    )
+                except Exception as e:
+                    print(f"    ⚠️ 落库失败: {e}")
+                print(f"    ❌ 按钮状态: {state}")
+            time.sleep(2 + random.uniform(0, 2))
+        if tab_lost:
+            continue          # DOM 已重置：回外层重新导航+抓卡（seen 已去重，不会重复处理）
+        page_num += 1
+    return applied, skipped, tab
+
+
+def main():
+    global HOURLY_CAP
+    args = sys.argv[1:]
+    cities = ["深圳", "广州", "杭州", "成都"]
+    keywords = ["AI应用工程师", "AI实施", "AI解决方案", "AI Agent", "AI智能体", "大模型应用", "LLM应用", "RPA开发"]
+    count = 10
+    if "--cities" in args:
+        cities = args[args.index("--cities")+1].split(",")
+    if "--jobs" in args:
+        keywords = args[args.index("--jobs")+1].split(",")
+    if "--count" in args:
+        count = int(args[args.index("--count")+1])
+
+    _safety = load_safety()
+    HOURLY_CAP = int(_safety.get("hourly_cap", HOURLY_CAP) or 0)
+
+    # 2026-09-15：与 shared.py 顶部明写的规矩对齐 —— 任何脚本执行写操作前必须调
+    # kill_switch_check()。此前 51job / 猎聘 完全不查急停开关：翻 kill switch 时
+    # Boss 停了、这两个平台照投不误。
+    from shared import kill_switch_check
+    import reply_lock     # 回复审核锁（v5 第十二条）
+    _allowed, _kreason = kill_switch_check()
+    if not _allowed:
+        print(f"⛔ kill switch 生效中，本轮 51job 不投递：{_kreason}")
+        alert("51job:kill_switch_block", "kill switch 生效中，51job 本轮未投递",
+              f"原因：{_kreason}\n恢复：python3 boss_apply.py --kill-off",
+              level="warn", throttle=1800)
+        return
+
+    # ── 全局 Chrome 互斥（2026-09-19 事故复盘）──────────────────
+    # 原来只有「启动时 pgrep 看一眼」的弱互斥，防不住后启动的进程和 cron 孤儿；
+    # 实测两个进程抢同一 Chrome 标签页，13 条 51job 投递回执被读空。
+    from chrome_lock import acquire as _chrome_acquire
+    if not _chrome_acquire("51job", wait_seconds=1500, max_minutes=40):
+        return
+
+    print(f"╔══ 51job v4 ══ 城市{len(cities)} 词{len(keywords)} "
+          f"上限{DAILY_LIMIT}/天 {HOURLY_CAP}/时 ══╗")
+    try:
+        page = ChromiumPage(PORT)
+    except Exception as e:
+        print(f"❌ Chrome 未连接(端口{PORT}): {e}")
+        alert("51job:chrome_down", "51job 无法连接 Chrome，本轮没投出去",
+              f"端口 {PORT} 连不上：{e}\n先确认调试端口的 Chrome 起着。",
+              level="error", throttle=1800)
+        return
+    sweep_stale_tabs(page)          # 先清僵尸页，再开自己的投递页
+    # 站外红线（2026-09-29）：历史遗留的应届生网/校招页，开跑前先清干净（用户明令）
+    FOREIGN_HITS["round"] = 0
+    _n_legacy = close_foreign_tabs()
+    if _n_legacy:
+        print(f"  🧹 站外遗留页清掉 {_n_legacy} 个（应届生网/校招通道，用户明令禁开）")
+    tab = page.new_tab("about:blank", background=True)  # 后台建标签：不把窗口顶到用户屏幕
+    tab = ensure_tab(page, tab)
+    if tab is None:
+        print("❌ 无法获得可用投递 tab，退出")
+        return
+    seen = set()
+    # 2026-09-10 修复: 原为进程内计数, 多轮跑会突破日限额。
+    # 改为启动时从 DB 读当日已投数, 跨轮累计受控。
+    today_applied = 0
+    try:
+        import sqlite3
+        from datetime import date as _date
+        _con = sqlite3.connect(str(DB_PATH))
+        _today = _date.today().isoformat()
+        today_applied = _con.execute(
+            "SELECT COUNT(*) FROM applications_v2 WHERE platform='51job' "
+            "AND date(created_at)=? AND status IN ('UNCERTAIN','APPLIED','VERIFIED')",
+            (_today,)).fetchone()[0] or 0
+        _con.close()
+        print(f"📊 今日已投 {today_applied}/{DAILY_LIMIT} 条(DB统计)")
+        if today_applied >= DAILY_LIMIT:
+            print("🛑 今日额度已满，退出")
+            alert("51job:quota_full", f"51job 今日额度已满（{today_applied}/{DAILY_LIMIT}）",
+                  "这是正常收工，不用处理。", level="info", throttle=43200)
+            return
+    except Exception as e:
+        print(f"⚠️ DB统计失败({e})，按0计")
+    total_a = total_s = 0
+    fatal = False
+    # 轮次方向（2026-09-23）：整轮关键词里只要出现游戏向的词（游戏/玩家），
+    # 这一轮就按「游戏行业岗」判 —— A 池的关键词里混着「活动运营」这类泛词，
+    # 逐词判会让泛运营岗从那些词里漏进来。
+    round_dir = round_direction(keywords)
+    if round_dir:
+        print(f"🎮 本轮判定为【游戏向】：标题不含游戏锚点的一律不投（job_decision 方向闸）")
+    _lock_warned = False  # 待审回复只告警一次，不刷屏（2026-09-24）
+    try:
+        for city in cities:
+            if today_applied >= DAILY_LIMIT or in_night_window() or fatal: break
+            for kw in keywords:
+                if today_applied >= DAILY_LIMIT: break
+                if in_night_window():
+                    print("  🌙 已到夜间禁投时段(22:00-8:00)，本轮收工")
+                    break
+                # ── 回复审核锁（2026-09-24 改：**不再暂停投递**）──
+                # 用户定稿「所有车道均可通行」：有待审 HR 回复 ≠ 停投。
+                # 回复走回复的车道（人工审核→发送），投递走投递的车道。
+                # 旧行为（v5 第十二条「回复 > 投递」硬停）实测代价过大：
+                # 9/23 19:33 入队 6 条 → 9/24 上午整轮 0 投。已废弃。
+                # 需要临时回到旧行为：export REPLY_LOCK_HALTS_APPLY=1
+                if reply_lock.is_locked() and os.environ.get("REPLY_LOCK_HALTS_APPLY") == "1":
+                    print(f"\n  🔒 [REPLY_REVIEW_LOCK] 检测到待审核 HR 回复 — "
+                          f"51job 在 {city}×{kw} 前暂停本轮投递（REPLY_LOCK_HALTS_APPLY=1 手动开启）")
+                    alert("51job:reply_lock_block", f"51job 因待审 HR 回复暂停（{city}×{kw}）",
+                          "有待审核的 HR 回复时暂停自动投递。\n"
+                          "审核：python3 reply_lock.py review ；审完自动恢复。",
+                          level="info", throttle=3600)
+                    fatal = True
+                    break
+                if reply_lock.is_locked() and not _lock_warned:
+                    _n = len([x for x in reply_lock.pending() if x.get("status") == "pending"])
+                    print(f"\n  ⚠️ 有 {_n} 条 HR 回复待审核 —— "
+                          f"按「所有车道均可通行」继续投递，不中断")
+                    _lock_warned = True
+                # 每个关键词前确认 tab 可用（掉线就重建，别让剩余关键词空转作废）
+                tab = ensure_tab(page, tab)
+                if tab is None:
+                    print("  🛑 tab 无法恢复，本轮收工")
+                    alert("51job:tab_lost", "51job 页面 tab 反复重建失败，本轮提前收工",
+                          "连续 3 次无法恢复页面，剩下的城市/关键词全部空转作废。",
+                          level="warn", throttle=0)
+                    fatal = True
+                    break
+                try:
+                    a, s, tab = run_city_keyword(page, tab, city, kw, count, seen, today_applied,
+                                                 direction=round_dir)
+                    total_a += a; total_s += s; today_applied += a
+                except Exception as e:
+                    print(f"  ❌ {city}/{kw}: {e}")
+                if today_applied < DAILY_LIMIT:
+                    rest = 15 + random.uniform(0, 10)
+                    print(f"  ☕ 休息 {rest:.0f}s (今日 {today_applied}/{DAILY_LIMIT})")
+                    time.sleep(rest)
+    finally:
+        try:
+            if tab is not None:
+                tab.close()
+        except Exception:
+            pass
+    print(f"╔══ 51job完成 ══ ✅ {total_a} 投 | ⏭️ {total_s} 跳 ══╗")
+
+
+if __name__ == "__main__":
+    main()

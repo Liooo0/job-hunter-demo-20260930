@@ -1,0 +1,109 @@
+# JOB-HUNTER v5 候选人画像 — 单一事实源（Single Source of Truth）
+# 改求职策略只改这里，不改 prompt、不改散落的代码常量。
+# 与 job_decision.py / guardrails.py 的一致性由 tests/test_candidate_profile.py 校验，漂移即红。
+version: "5.0"
+updated: "2026-08-31"
+
+location:
+  # v5.1 地区可达性分级（2026-08-31 定稿）：候选人所在地本身就是 HR 的筛选条件。
+  # 地区不再只是 Value Score 的普通加分，而是贯穿 搜索顺序 + Plan2门槛 + 价值评分 三层。
+  # 不是"外地不要"，而是"外地需要更高价值才值得消耗一个投递额度"。
+  tier:
+    S: [深圳]                      # 人在深圳，HR 零迁移不确定性 → 主战场
+    A: [广州]                      # 珠三角低成本流动 → 近距离扩展
+    B: [杭州, 南京, 成都]          # 可考虑，但需更强岗位价值支付"异地阻力"
+    C: [其他]                      # 兜底档：需明显高薪/强匹配/远程/接受异地
+    # 珠三角卫星城（东莞/佛山等）如需升级改这一行即可，代码零改动
+  plan2_salary_floor:              # Plan2 入场薪资线随地区档上浮（异地阻力用薪资支付）
+    S: 10000
+    A: 10000
+    B: 12000
+    C: 14000
+  relocation: {acceptable: true, preferred: false}
+  local_preference:
+    exact_local: true              # "仅限本地" → 极高异地风险，评分归零
+    local_prefer_penalty: true     # "本地优先" → 仅减分，不拦截
+  remote_signals:                  # JD 明示接受异地/远程 → 风险下调
+    accept: [接受异地, 异地候选人, 优秀的异地, 接受外地, 可远程, 远程办公,
+             居家办公, 提供住宿, 包住异地, 搬迁补贴]
+    local_only: [仅限本地, 只考虑本地, 不考虑异地, 不接受异地, 本地候选人优先勿扰, 需本地到岗]
+    local_prefer: [本地优先]
+  # 兼容旧字段（_resolve_cities 派生用）：
+  primary: [深圳, 广州]
+  secondary: [杭州, 南京, 佛山, 东莞, 惠州, 珠海, 中山, 成都]
+  remote: acceptable            # AI 线岗位可接受长期远程
+
+salary:                          # 单位：元/月。三档与 job_decision 代码常量锁死一致
+  target: 10000                  # ≥10K 高优先（= SALARY_PRIORITY * 1000）
+  preferred: 12000
+  acceptable: 8000               # 8-10K 正常可投（= SALARY_NORMAL_FLOOR * 1000）
+  # 2026-09-05 定稿：底薪(无责底薪) ≥8K 才投，绩效/提成不算。
+  # 区间5-8K默认拒，除非JD明确"底薪8K+"或编制特批（聚客7K底薪5K=反面案例）。
+  base_salary_policy: base_ge_8k  # 底薪口径：标注区间达标不够，须底薪≥8K
+  exceptional_floor: 5000        # 5-8K 仅特批通道（= SALARY_HARD_FLOOR * 1000）
+  unknown_policy: not_reject     # 未知/面议 不因薪资拒
+
+culture_redlines:                # 2026-09-05：狼性/多劳多得公司直接排除（用户定稿）
+  - 狼性
+  - 多劳多得
+  - 结果导向
+  - 能者多劳
+  - 奋斗者
+  - 996是福报
+
+work:
+  required: [双休]
+  preferred: [五险一金, 正常工作时间, 弹性办公, 小团队, 加班少, 不加班]
+  # 完整词表 = L2 WORKDAY_REDLINES 全集（17词）+ 就业形态词。
+  # 加词流程：先改 job_decision.py 常量 → 同步这里 → 跑 tests/test_v5_core.py 锁一致。
+  blocked: [单休, 大小周, 单双休, "996", "007", 上六休一, 做六休一, 轮班, 倒班, 三班倒, 两班倒,
+            夜班, 通宵, 月休4天, 月休四天, 每周休1天, 每周休息一天, 24小时值班]   # 命中即死，任何薪资档不豁免
+  blocked_employment: [外包, 驻场, 劳务派遣, 长期出差, 全国出差]
+
+career:
+  plan1:                         # 职业主线：发现即优先消耗额度，永远排在 plan2 前
+    P1-A: [AI应用工程师, 大模型应用, Agent, RAG, 知识库, AI应用开发, 智能体开发,
+           智能座舱AI, 座舱大模型, 车载AI, 车载语音, 车机AI, 游戏AI, AIGC游戏]
+    P1-B: [AI实施, AI交付, AI解决方案, AI自动化, RPA, 工作流, 流程自动化]
+    P1-C: [AI产品, AI产品运营, AI训练师, AI评测, AI大模型运营, AI内容运营]
+    P1-D: [Python+AI, 自动化开发, 业务自动化, AI工具链, 低代码实施]
+  plan2:                         # 收入扩展池：只填 plan1 用剩的容量，不是垃圾岗位池
+    salary_min: 10000            # plan2 入场资格 = ≥10K 且过硬规则
+    tiers:
+      P2-A: 高度相关（AI数据/模型周边、LLM测试评估）
+      P2-B: 数字化/自动化/产品/项目类
+      P2-C: 职业相关性一般（软件测试/技术支持/实施顾问）
+    rule: 薪资只决定资格不决定相关度；岗位名落进 blocked_roles 的高薪岗照样 BLOCK
+
+blocked_roles:                   # 职业错位硬拦（plan_router 只看岗位标题；薪资再高不进池；plan2 不救）
+  - 数据标注
+  - 内容审核
+  - 图片审核
+  - 文本审核
+  - 销售
+  - 客服
+  - 电销
+  - 短视频
+  - 短剧
+  - 漫剧
+  - 视频剪辑
+  - 算法工程师
+  - 模型训练
+  - 后端开发
+  - Java开发
+  - 采购              # 采购是 D 简历独立线，不进 AI 线池
+  - 保险销售
+  - 课程顾问
+
+special_override:                # 正式稳定通道：低薪高质量例外（南方电网条款）
+  formal_stable_job:
+    enabled: true
+    salary_floor: 5000
+    signals: [编制, 国企, 央企, 事业单位, 正式工, 正式员工, 事业编, 公务员,
+              南方电网, 国家电网, 中石油, 中石化, 铁路局, 烟草]
+
+quota:
+  daily_quota: 150               # v5 预算上限（只算 VERIFIED/SENT）
+  # 实际生效上限 = min(daily_quota, config.json safety.normal_daily_cap)
+  # 风控硬顶永远优先 — 为了凑 150 突破风控 = 违反验收标准 6
+  uncertain_counts_as_sent: false  # UNCERTAIN 不计入完成数，验证后升级才扣额

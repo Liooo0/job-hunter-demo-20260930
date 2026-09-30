@@ -1,0 +1,25 @@
+{
+  "_doc": "public_repo_guard 的仓库级声明。例外必须显式写在这里并说明理由（可 review），不要改引擎。",
+  "_why": "本仓库的公开数据放 datasets/public/（见该目录 README），无需额外例外。",
+  "declared_public": [],
+  "extra_deny_paths": [],
+  "extra_allow_content": [
+    "no-reply@apple.com",
+    "order_acknowledgment@apple.com",
+    "order_acknowledgment@email.apple.com",
+    "noreply@icloud.com.cn",
+    "no-reply@roblox.com",
+    "no-reply@accounts.google.com",
+    "noreply@m.xiaomi.com",
+    "10000@qq.com",
+    "system@successfactors.example.com",
+    "service@51job.example.com"
+  ],
+  "pii_gate": {
+    "_doc": "fail-closed 声明。local_only = 本机（非 CI）必须有明文词表；CI 里明文不存在，姓名维由仓内 keyed HMAC 哈希表 + Actions Secret 覆盖。任一路径缺失一律判红，不再出现「缺输入 → 静默 PASS」。",
+    "require_denylist": "local_only",
+    "require_hash_file": true,
+    "require_key": true,
+    "hash_file": ".github/pii-hashes.txt"
+  }
+}

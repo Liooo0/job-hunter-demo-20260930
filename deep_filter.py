@@ -1,0 +1,403 @@
+"""深度筛选模块 — 标题党检测 + 公司背调（2026-08-07 新增）
+
+解决 2026-08-07 验证出的三类漏网：
+1. 标题党：标题带 AI，正文是传统开发（华勤=Android车载、餐谋团=全栈运维）
+2. 公司伪装：单岗位看着行，公司其实是销售/标注外包（奇合创、卓越际联）
+3. 实习薪资陷阱：标题写月薪区间，正文实际日薪<300（小和云起 200/天）
+
+设计原则：
+- 标题党检测 = 纯本地文本分析，零成本，每次调用
+- 公司背调 = 搜索 API 拉公司全部在招岗位，带本地缓存（data/company_profiles.json），
+  每公司只查一次；API 失败时降级为"未知"，不误杀
+- 风控：背调请求间隔 ≥8s，且只对"即将投递"的岗位做（本地过滤全过之后）
+"""
+
+import json
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+# ═══════════════════════════════════════════════════════════════
+# 标题党检测（本地）
+# ═══════════════════════════════════════════════════════════════
+
+# 标题里出现这些 = 岗位宣称是 AI 岗
+AI_TITLE_SIGNALS = [
+    "ai应用", "ai 应用", "ai工程师", "ai 工程师", "ai开发", "ai 开发",
+    "智能体", "agent", "llm", "大模型", "rag", "aigc", "ai agent",
+    "ai训练", "ai 训练", "ai产品", "ai 产品", "ai运营", "ai 运营",
+    "ai工作流", "ai 工作流", "prompt", "提示词", "gpt", "coze", "dify",
+    "ai自动化", "ai 自动化", "ai解决方案", "ai 解决方案", "数字员工",
+    "ai多模态", "ai 多模态", "ai标注", "ai 标注", "ai评测", "ai 评测",
+]
+
+# 正文里出现这些 = 传统开发技术栈（非 AI 应用开发）
+TRADITIONAL_STACK = [
+    "android", "ios", "flutter", "react native", "rn开发", "小程序开发",
+    "vue", "react", "css", "html", "javascript", "typescript", "node.js",
+    "spring", "springboot", "spring cloud", "golang", "java开发",
+    "java 后端", "后端开发", "全栈", "前端开发", "运维", "k8s", "kubernetes",
+    "docker部署", "数据库", "mysql", "postgresql", "oracle", "sql server",
+    "etl", "hadoop", "spark", "数据仓库", "c++", "c/c++", "c#", ".net",
+    "嵌入式", "单片机", "fpga", "驱动开发", "固件",
+    "车机", "座舱", "车载", "android framework", "launcher",
+    "架构设计", "微服务", "高并发", "性能优化", "中间件",
+    # 传统业务系统（评审 2026-08-07 补充）
+    "erp", "oa系统", "crm", "电商后台", "交易系统", "订单系统",
+    "支付系统", "报表系统", "管理系统开发",
+]
+
+# Python 后端 + LLM = AI 应用岗的常见形态，不算传统业务后端。
+# 当正文出现这些时，即使有"后端/全栈"字样也不判定为传统开发。
+PYTHON_AI_SAFE = [
+    "python", "fastapi", "flask", "llm", "大模型", "rag", "agent",
+    "langchain", "langgraph", "智能体", "向量", "embedding", "prompt",
+    "dify", "coze", "mcp", "openai", "deepseek", "qwen", "api对接",
+    "工作流", "ai应用", "知识库",
+]
+
+# 正文里出现这些 = 真 AI 应用开发（有这些就说明 AI 含量足）
+REAL_AI_STACK = [
+    "agent", "智能体", "rag", "检索增强", "向量", "embedding",
+    "langchain", "langgraph", "dify", "coze", "扣子", "提示词",
+    "prompt", "大模型", "llm", "gpt", "千问", "qwen", "deepseek",
+    "glm", "kimi", "文心", "通义", "模型微调", "sft", "lora",
+    "ai agent", "工作流", "workflow", "function calling", "工具调用",
+    "mcp", "知识库", "ai应用", "aigc", "文生图", "多模态",
+]
+
+# 实习日薪提取（正文）
+DAILY_RATE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*元/(?:天|日)")
+
+# AI 包装检测：废话词（战略/愿景类）多但无技术词 = 假 AI 岗（可能销售/卖课）
+AI_BUZZWORDS = ["赋能", "生态", "愿景", "探索人工智能", "推动ai", "引领", "数字化转",
+                "ai+", "ai赋能", "拥抱ai", "人工智能未来"]
+AI_TECH_REQUIRED = ["api", "模型", "代码", "工具", "平台", "流程", "系统",
+                    "python", "rag", "agent", "llm", "大模型", "prompt", "知识库"]
+
+
+def detect_clickbait(title: str, desc: str) -> tuple[bool, str]:
+    """检测标题党：标题宣称 AI 岗，但正文是传统开发。
+
+    返回 (是否标题党, 原因)。
+    规则：标题命中 AI 信号 且（正文传统技术栈≥2 或 传统栈≥1且AI栈==0）
+    Python 后端 + LLM/API 对接 = AI 应用岗常见形态，不判传统开发。
+    """
+    t = (title or "").lower()
+    d = (desc or "").lower()
+
+    # 标题没有 AI 信号 → 不是标题党（可能是普通岗，由其他规则处理）
+    if not any(sig in t for sig in AI_TITLE_SIGNALS):
+        return False, ""
+
+    # Python+LLM 保护：正文出现 AI 安全词时，传统栈命中不计（Python 后端是 AI 岗常态）
+    python_ai_protected = any(kw in d for kw in PYTHON_AI_SAFE)
+    trad_hits = [kw for kw in TRADITIONAL_STACK if kw in d and not (python_ai_protected and kw in ("后端开发", "全栈"))]
+    ai_hits = [kw for kw in REAL_AI_STACK if kw in d]
+
+    # 标题含"实习"时，AI 信号里"ai应用/agent"等可能只是标题蹭词
+    is_intern = "实习" in t
+
+    if len(trad_hits) >= 2 and len(ai_hits) == 0:
+        return True, f"标题党:标题含AI但正文是传统开发({'/'.join(trad_hits[:3])})"
+    if len(trad_hits) >= 1 and len(ai_hits) == 0 and not is_intern:
+        return True, f"标题党:标题含AI但正文无AI技术词({trad_hits[0]})"
+    # 实习岗放宽：日薪>=300 已由 smart_filter 处理，这里只拦"纯传统栈实习"
+    if is_intern and len(trad_hits) >= 3 and len(ai_hits) == 0:
+        return True, f"标题党(实习):正文是传统开发({'/'.join(trad_hits[:3])})"
+
+    return False, ""
+
+
+def extract_daily_rate(desc: str, salary: str) -> Optional[float]:
+    """从 JD 正文提取日薪（元/天）。标题薪资字段是月薪区间时正文可能写日薪。"""
+    for m in DAILY_RATE_RE.finditer(desc or ""):
+        return float(m.group(1))
+    return None
+
+
+def detect_salary_trap(title: str, desc: str, salary: str) -> tuple[bool, str]:
+    """实习薪资陷阱：标题显示月薪区间（如 10-15K），正文实际日薪<300。"""
+    if "实习" not in (title or ""):
+        return False, ""
+    daily = extract_daily_rate(desc, salary)
+    if daily is not None and daily < 300:
+        return True, f"实习薪资陷阱:正文日薪{daily:.0f}元/天<300"
+    return False, ""
+
+
+def detect_ai_washing(title: str, desc: str) -> tuple[bool, str]:
+    """AI 包装检测：JD 大量"赋能/生态/愿景"废话但无技术词 = 假 AI 岗。
+
+    规则：废话词 ≥2 且 技术词 == 0 → 包装岗（可能销售/卖课/公关）
+    """
+    d = (desc or "").lower()
+    buzz_hits = [kw for kw in AI_BUZZWORDS if kw in d]
+    tech_hits = [kw for kw in AI_TECH_REQUIRED if kw in d]
+    if len(buzz_hits) >= 2 and len(tech_hits) == 0:
+        return True, f"AI包装:废话词({'/'.join(buzz_hits[:3])})但无技术词"
+    return False, ""
+
+
+# ═══════════════════════════════════════════════════════════════
+# v4.0 判断内核：AI 包装运营（AI-1）+ 职责过宽（Role Creep）
+# ═══════════════════════════════════════════════════════════════
+
+# 标题宣称"AI 内容/运营"类岗位（AI-1 重点检查对象）
+AI_OP_TITLE_SIGNALS = [
+    "ai运营", "ai 运营", "ai内容", "ai 内容", "ai文案", "ai 文案",
+    "ai新媒体", "ai 新媒体", "aigc运营", "数字人运营", "ai主播", "ai 主播",
+    "ai视频运营", "ai 视频运营",
+]
+
+# 纯运营执行词：出现这些=干的还是内容号/社群的活
+OPS_EXEC_WORDS = ["公众号", "文案", "社群", "粉丝", "短视频运营", "直播带货",
+                  "直播运营", "探店", "种草", "引流内容", "日常更新", "稿件"]
+
+# 真实技术动作词：有这些=复合岗（AI+运营/内容技术化），不拦
+TECH_ACTION_WORDS = ["搭建", "接口开发", "api开发", "部署", "集成", "检索优化",
+                     "知识库构建", "workflow配置", "工作流配置", "agent开发",
+                     "rag开发", "后端开发", "前端开发", "自动化脚本", "脚本开发",
+                     "系统开发", "数据清洗", "数据处理", "流程自动化", "应用开发",
+                     "模型调用", "prompt调优", "提示词工程", "向量化", "embedding"]
+
+# 职责域（Role Creep：一人多岗 = 公司风险信号，v4.0 公司风险/Reality 第4维）
+ROLE_DOMAINS = {
+    "研发": ["开发", "编码", "后端", "前端", "全栈", "接口", "代码"],
+    "产品": ["产品设计", "产品规划", "需求分析", "原型", "产品经理"],
+    "设计": ["ui设计", "ux", "界面设计", "视觉设计", "美工", "网页设计"],
+    "销售": ["销售", "客户开发", "商务", "拓展", "业绩", "kpi", "招商", "渠道", "客户拜访"],
+    "客服": ["客服", "售后", "客户维护", "客户咨询", "接待", "答疑"],
+    "运营": ["运营", "社群", "公众号", "新媒体", "直播", "推广", "引流"],
+    "运维": ["运维", "部署", "服务器", "网管", "监控告警"],
+    "行政": ["行政", "人事", "财务", "报销", "考勤"],
+}
+
+
+def detect_ai_wrapped_ops(title: str, desc: str) -> tuple[bool, str]:
+    """AI 包装运营检测（v4.0 AI-1 落地）。
+
+    标题宣称 AI 运营/内容，正文只有运营执行词（公众号/文案/社群），
+    且无任何真实技术动作 → 干的还是内容号/客服的活 = AI-1 包装。
+    有真实技术动作（搭建/开发/部署/流程自动化等）→ 复合岗，不拦。
+    """
+    t = (title or "").lower()
+    d = (desc or "").lower()
+    if not any(sig in t for sig in AI_OP_TITLE_SIGNALS):
+        return False, ""
+    ops_hits = [w for w in OPS_EXEC_WORDS if w in d]
+    if not ops_hits:
+        return False, ""
+    if any(w in d for w in TECH_ACTION_WORDS):
+        return False, ""
+    return True, f"AI包装运营:标题AI但职责是运营执行({'/'.join(ops_hits[:3])})，无技术动作"
+
+
+def detect_role_creep(desc: str) -> tuple[bool, str]:
+    """职责过宽检测（v4.0 Role Creep / Reality Score 第4维）。
+
+    统计不同职责域命中数（研发/产品/设计/销售/客服/运营/运维/行政）。
+    技术词 ≥2（复合 AI 岗正常）→ 需 ≥6 域才拦；否则 ≥4 域拦。
+    一个 8K 岗要求 AI+Python+产品+UI+销售+客服+运维 = 一人干五人的活。
+    """
+    d = (desc or "").lower()
+    ai_tech = sum(1 for kw in REAL_AI_STACK if kw in d)
+    hits = [dom for dom, kws in ROLE_DOMAINS.items() if any(kw in d for kw in kws)]
+    threshold = 6 if ai_tech >= 2 else 4
+    if len(hits) >= threshold:
+        return True, f"一人多岗:职责过宽({'/'.join(hits)})"
+    return False, ""
+
+
+# ═══════════════════════════════════════════════════════════════
+# 公司背调（搜索 API + 本地缓存）
+# ═══════════════════════════════════════════════════════════════
+
+CACHE_FILE = Path(__file__).parent / "data" / "company_profiles.json"
+
+# 内存缓存：避免重复调用 callback。key = f"{company}|{city}"，value = profile dict。
+# 失败结果也缓存（kind="unknown"），避免对同一公司反复触发失败重试。
+_memory_cache: dict[str, dict] = {}
+
+# 公司性质判定关键词
+SALES_JOB_WORDS = ["销售", "推销", "电话销售", "客户顾问", "业务员", "市场专员",
+                   "推广", "地推", "招商", "渠道", "商务拓展", "bd", "导购",
+                   "客服", "接线", "电销"]
+ANNOTATION_JOB_WORDS = ["标注", "评测", "数据标注", "sft", "rlhf", "rm训练",
+                        "训练师", "数据清洗", "打标", "审核", "内容安全",
+                        "ai训练", "大模型训练", "标注员"]
+REAL_AI_JOB_WORDS = ["ai应用", "agent", "智能体", "rag", "大模型应用", "llm应用",
+                     "dify", "coze", "工作流", "ai产品", "ai运营", "prompt",
+                     "ai工程师", "ai开发", "aigc", "多模态", "数字员工"]
+# 公司名风险词：人力中介/外包/培训公司招的"AI"岗大概率是代招/卖课/驻场
+RISK_COMPANY_WORDS = ["人力资源", "劳务派遣", "人才服务", "外包", "咨询", "培训",
+                      "教育科技", "信息科技服务", "技术服务有限", "派遣"]
+# 公司名出现这些词且岗位是 AI 类 → 高风险降级
+RISK_COMPANY_STRONG = ["人力资源", "劳务", "派遣", "代招", "猎头"]
+
+# CITY_CODES 已统一到 shared.py（P2-T6）。原本地副本唯一使用方 _fetch_company_jobs
+# 是 NotImplementedError 死代码，已一并删除，故本文件不再需要城市代码。
+
+
+def _load_cache() -> dict:
+    if CACHE_FILE.exists():
+        try:
+            return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_cache(cache: dict):
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def profile_company(jobs: list) -> dict:
+    """根据公司全部在招岗位列表，判定公司性质。
+
+    返回 {kind, sales_n, annot_n, ai_n, total, jobs}
+    kind: 'sales' | 'annotation' | 'ok' | 'unknown'
+    """
+    total = len(jobs)
+    if total == 0:
+        return {"kind": "unknown", "total": 0, "jobs": []}
+    sales_n = sum(1 for j in jobs if any(w in j.get("name", "") for w in SALES_JOB_WORDS))
+    annot_n = sum(1 for j in jobs if any(w in j.get("name", "") for w in ANNOTATION_JOB_WORDS))
+    ai_n = sum(1 for j in jobs if any(w in j.get("name", "").lower() for w in REAL_AI_JOB_WORDS))
+
+    # 销售岗占多数 → 销售公司
+    if sales_n >= 3 and sales_n / total >= 0.4:
+        return {"kind": "sales", "sales_n": sales_n, "annot_n": annot_n,
+                "ai_n": ai_n, "total": total, "jobs": jobs[:8]}
+    # 标注/评测岗占多数 → 标注外包
+    if annot_n >= 2 and annot_n / total >= 0.4:
+        return {"kind": "annotation", "sales_n": sales_n, "annot_n": annot_n,
+                "ai_n": ai_n, "total": total, "jobs": jobs[:8]}
+    return {"kind": "ok", "sales_n": sales_n, "annot_n": annot_n,
+            "ai_n": ai_n, "total": total, "jobs": jobs[:8]}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 组合入口
+# ═══════════════════════════════════════════════════════════════
+
+# 决策优先级（从高到低，一旦命中立即截断返回，不可被后续规则覆盖）
+# 1. clickbait  2. internship salary trap  3. AI washing  4. AI-wrapped operations
+# 5. role creep  6. company profile  7. company-name risk  8. preserve incoming score
+DECISION_PRIORITY = [
+    "clickbait", "internship_salary_trap", "ai_washing", "ai_wrapped_operations",
+    "role_creep", "company_profile", "company_name_risk", "preserve",
+]
+
+
+def deep_filter(company: str, title: str, desc: str, salary: str,
+                score: int, profile: Optional[dict] = None) -> tuple[int, str]:
+    """深度筛选总入口。
+
+    profile: 公司画像（来自背调），None = 未背调（跳过公司规则）
+    返回 (adjusted_score, reason)。
+
+    ⚠️ 判定「是否被拦下」请用 is_filtered(score, reason)，**不要**用 score == 0：
+    未命中规则时会原样返回入参 score，传 0 进来同样得到 0。原因字符串才是判据。
+    """
+    # Priority 1: 标题党检测（本地）
+    clickbait, reason = detect_clickbait(title, desc)
+    if clickbait:
+        return 0, reason
+
+    # Priority 2: 实习薪资陷阱（本地）
+    trap, reason = detect_salary_trap(title, desc, salary)
+    if trap:
+        return 0, reason
+
+    # Priority 3: AI 包装检测（本地）：赋能/生态废话多但无技术词
+    wash, reason = detect_ai_washing(title, desc)
+    if wash:
+        return 0, reason
+
+    # Priority 4: AI 包装运营检测（v4.0 AI-1）：标题AI运营+正文纯运营执行+无技术动作
+    wrap_ops, reason = detect_ai_wrapped_ops(title, desc)
+    if wrap_ops:
+        return 0, reason
+
+    # Priority 5: 职责过宽检测（v4.0 Role Creep）：一人多岗=公司风险信号
+    creep, reason = detect_role_creep(desc)
+    if creep:
+        return 0, reason
+
+    # Priority 6: 公司性质（需背调结果）
+    if profile:
+        kind = profile.get("kind")
+        if kind == "sales":
+            return 0, f"公司背调:销售公司({profile.get('sales_n')}/{profile.get('total')}销售岗)"
+        if kind == "annotation":
+            return 0, f"公司背调:标注外包({profile.get('annot_n')}/{profile.get('total')}标注岗)"
+
+    # Priority 7: 公司名风险词（本地，无需背调）：人力/劳务/派遣/代招 → 直接弃
+    comp_lower = (company or "").lower()
+    for kw in RISK_COMPANY_STRONG:
+        if kw in comp_lower:
+            return 0, f"公司名含「{kw}」→人力中介/代招风险"
+
+    # Priority 8: 无命中风险项 → **原样返回传入的 score**
+    # ⚠️ 注意这里返回的是入参 score，不是常量 100：调用方若传进来 0 分（例如
+    #    shared.score_jd 因标题命中排除词而归零），返回值同样是 (0, "")。
+    #    所以**绝不能**用 `adjusted_score == 0` 判断「deep_filter 拦了这个岗」——
+    #    (0, "") 是「通过」。(0, "标题党:…") 才是「拦截」。
+    #    判据统一走下面的 is_filtered()。
+    return score, ""
+
+
+def is_filtered(adjusted_score: int, reason: str) -> bool:
+    """deep_filter 的结果是否表示「这个岗被拦下了」。**唯一判据。**
+
+    为什么不能用 adjusted_score == 0 判：未命中任何规则时 deep_filter 原样返回入参
+    score（见上面 Priority 8），传 0 进来就得到 (0, "")。历史实现正是这么写的 ——
+
+        2026-09-20 查到：`if deep_score == 0` 把「入参本来就是 0 分」误当成 deep_filter
+        拦截，于是 score_jd 已经给出的真实原因（「标题包含排除词: 应届」…）被一个空串
+        覆盖后落库。8/23 起 Boss 端 1048 条 SKIPPED 的 reason 就是这么丢的 ——
+        全部 event=deep_filter、reason=''、score=0，而岗位其实一个都没被 deep_filter 拦过。
+
+    判据只有一个：有没有给出原因。拦截路径（Priority 1-7）全都带原因，通过路径恒为空串。
+    """
+    return bool(reason)
+
+
+def run_company_background_check(company: str, city: str, eval_js_fn) -> dict:
+    """执行公司背调：查内存缓存 → 调 callback → 解析 JSON → 生成 profile → 写入缓存。
+
+    严禁发起实际网络调用；测试通过传入的 mock/fake callback 注入。
+    正常流程：调用 callback → 解析 JSON → 生成 profile → 写入内存缓存。
+    缓存命中时不得重复调用 callback。
+    容错降级：遇到畸形 JSON、callback 异常、或 ERR: 字符串响应时：
+      - 降级为 kind = "unknown"
+      - 对 unknown 状态实行保护，不得误杀岗位，维持原始分数
+      - 将失败记录同样写入缓存（标记为 unknown），避免对同一公司反复触发失败重试
+      - 严禁在异常情况下凭空推断生成 sales/annotation/risk 等虚假画像
+    """
+    key = f"{company}|{city}"
+    # 内存缓存命中 → 直接返回，不调用 callback
+    if key in _memory_cache:
+        return _memory_cache[key]
+
+    profile: dict = {}
+    try:
+        jobs_raw = eval_js_fn(company, city)
+        # ERR: 字符串响应 → 降级为 unknown
+        if not jobs_raw or (isinstance(jobs_raw, str) and jobs_raw.startswith("ERR:")):
+            profile = {"kind": "unknown", "total": 0, "jobs": []}
+        else:
+            data = json.loads(jobs_raw)
+            jobs = [j for j in data if company[:4] in j.get("brand", "")] or data
+            profile = profile_company(jobs)
+    except Exception:
+        # 畸形 JSON / callback 异常 → 降级为 unknown，不凭空推断
+        profile = {"kind": "unknown", "total": 0, "jobs": []}
+
+    # 缓存结果（含 unknown 状态，避免重复触发失败重试）
+    _memory_cache[key] = profile
+    return profile

@@ -1,0 +1,102 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+
+# ===== 运行时状态标记（本机 kill switch / 恢复期倒计时）=====
+.paused
+.sleep_tracker
+.kill_switch
+.recovery_until
+
+# ===== HR 真实对话记录 =====
+pending_replies/
+archived_replies/
+sent_replies/
+# ★ 本机个性化档案（含真实姓名/背景），公开仓库只留 PII-free 默认值
+# ── 治本（2026-09-18）：整个 data/ 一律不进 Git ──
+# 旧写法是逐个文件名（data/reply_pending.json 等），新出现的运行数据
+# （如 data/51job_status.json）每次都漏，闸门 L1 每次都要兜。
+# 规则：运行数据属于本机，公开物只走 datasets/public/。
+data/
+!datasets/
+data/my_profile.txt
+# ★ 2026-09-15 修复：上一版只挡了目录，漏了实际在用的 json 文件，
+#   结果 data/reply_pending.json（含 HR 姓名/公司/对话原文/拟发内容）
+#   被追踪并推到了公开仓库。凡含真实对话的 json 一律挡。
+data/reply_pending.json
+data/reply_pending*.json
+data/reply_stats.json
+
+# ===== 本机运行时状态（含本机路径/时间戳，非代码）=====
+data/mail_scan_state.json
+data/queue_checkpoint.json
+data/queue_checkpoint.json.*
+data/github_repos.json
+data/alert_state.json
+data/*.lock
+# 全局 Chrome 互斥锁（chrome_lock.py 的运行时产物，含持有者 pid/时间戳）
+.chrome.lock
+
+# ===== 备份与产物（不入库）=====
+backup-*/
+ab_experiment_backup_*.db
+*.bak
+*.bak.*
+
+# ===== 投递日志 + 运行日志 + HTML 报告（含真实公司名/投递流水）=====
+boss-*-log.json
+51job-*-log.json
+data/logs/
+data/reports/*.html
+followups.json
+
+# ===== A/B 实验数据 & 公司画像（真实采集数据，非代码）=====
+ab_experiment.db
+data/company_profiles.json
+
+# ===== 本机配置与调度文件（含绝对路径；用 config.example.json 作为模板分享）=====
+config.json
+com.*.job-hunter.plist
+dry_run_plan.json
+
+# ===== config 变体/备份（含本机 resume_path 与含真名的招呼语）=====
+config.*.json
+config.json.bak-*
+config.procurement.json
+.DS_Store
+
+# ===== 个人隐私文件（本机保留，不入库）=====
+persona.md
+HANDOFF_CLAUDE.md
+
+# ===== 任务书(含敏感信息示例,永不入库)=====
+BRIEF_*.md
+
+# 告警凭据（不进公开仓库）
+.env.local
+
+# 本地 UI / 登录态探测脚本（可能读取平台真实数据）
+check_boss_state.py
+check_liepin_login.py
+peek_boss*.py
+peek_liepin.py
+ui_probe*.py
+probe_notify*.py
+snapshot_click_flow.py
+scripts/probe_*.py
+scripts/peek_*.py
+scripts/dump*.py
+scripts/find_51job_*.py
+scripts/inspect_*.py
+scripts/test51_*.py
+scripts/try_51job_*.py
+scripts/edit51_*.py
+scripts/fix51_*.py
+scripts/apply51_*.py
+
+# SQLite WAL 模式产生的临时文件
+*.db-wal
+*.db-shm
+
+# Agent 审计状态目录（永不入库）
+.agent-state/
